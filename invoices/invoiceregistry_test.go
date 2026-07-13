@@ -1710,6 +1710,100 @@ func TestMppPaymentToAmountlessInvoice(t *testing.T) {
 	}
 }
 
+// TestMppPaymentCommittedTotalTooLow proves that for a fixed-amount invoice an
+// MPP payment whose sender-committed total (total_msat) is below the invoice's
+// own amount is rejected with ResultHtlcSetTotalTooLow. This is the
+// "totalAmt < inv.Terms.Value" guard in updateMpp: it fires on the very first
+// HTLC, before any set has a chance to complete, so a payer cannot settle the
+// invoice by committing to less than it asked for. A committed total that meets
+// the invoice amount is accepted, pinning the check to a strict "less than".
+func TestMppPaymentCommittedTotalTooLow(t *testing.T) {
+	t.Parallel()
+
+	makeDB := func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock) {
+		testClock := clock.NewTestClock(testTime)
+		db, err := channeldb.MakeTestInvoiceDB(
+			t, channeldb.OptionClock(testClock),
+		)
+		require.NoError(t, err, "unable to make test db")
+
+		return db, testClock
+	}
+
+	tests := []struct {
+		name       string
+		committed  lnwire.MilliSatoshi
+		expectFail bool
+	}{
+		{
+			// One msat short of the invoice amount is rejected.
+			name:       "committed total below invoice value",
+			committed:  testInvoiceAmount - 1,
+			expectFail: true,
+		},
+		{
+			// Committing to exactly the invoice amount is accepted.
+			name:       "committed total meets invoice value",
+			committed:  testInvoiceAmount,
+			expectFail: false,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			defer timeout()()
+
+			ctx := newTestContext(t, nil, makeDB)
+
+			// A regular fixed-amount invoice (Value =
+			// testInvoiceAmount).
+			inv := newInvoice(t, false, false)
+			_, err := ctx.registry.AddInvoice(
+				t.Context(), inv, testInvoicePaymentHash,
+			)
+			require.NoError(t, err)
+
+			// Deliver a single HTLC committing to tc.committed as
+			// the total for the set.
+			res, err := ctx.registry.NotifyExitHopHtlc(
+				testInvoicePaymentHash, tc.committed,
+				testHtlcExpiry, testCurrentHeight,
+				getCircuitKey(1), make(chan interface{}, 1), nil,
+				&mockPayload{
+					mpp: record.NewMPP(
+						tc.committed, [32]byte{},
+					),
+				},
+			)
+			require.NoError(t, err)
+
+			if tc.expectFail {
+				checkFailResolution(
+					t, res, invpkg.ResultHtlcSetTotalTooLow,
+				)
+
+				inv, err := ctx.registry.LookupInvoice(
+					t.Context(), testInvoicePaymentHash,
+				)
+				require.NoError(t, err)
+				require.Equal(
+					t, invpkg.ContractOpen, inv.State,
+				)
+
+				return
+			}
+
+			// A committed total that meets the invoice amount and
+			// is delivered in full by this HTLC settles immediately.
+			settle := checkSettleResolution(
+				t, res, testInvoicePreimage,
+			)
+			require.Equal(t, invpkg.ResultSettled, settle.Outcome)
+		})
+	}
+}
+
 // testInvoiceExpiryWithRegistry tests that invoices are canceled after
 // expiration.
 func testInvoiceExpiryWithRegistry(t *testing.T,
