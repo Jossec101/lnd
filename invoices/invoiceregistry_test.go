@@ -1213,6 +1213,503 @@ func testMppPaymentWithOverpayment(t *testing.T,
 	}
 }
 
+// amountlessSenderTotal is the amount the honest payer (Alice) commits to
+// paying an amountless invoice; amountlessDustAmt is the dust amount a
+// malicious last hop (Mallory) tries to settle for while stealing the preimage.
+const (
+	amountlessSenderTotal = lnwire.MilliSatoshi(1_000_000)
+	amountlessDustAmt     = lnwire.MilliSatoshi(1_000)
+)
+
+// newAmountlessInvoiceCtx creates a fresh registry (backed by an in-memory kv
+// invoice DB) holding a single realistic amountless invoice: zero value, a
+// random payment address known only to the payer (via the BOLT11 invoice) and
+// the recipient, a real preimage, and the payment-address-required feature bit
+// that lnd sets on all modern invoices. It returns the context and the
+// invoice's payment address.
+func newAmountlessInvoiceCtx(t *testing.T) (*testContext, [32]byte) {
+	t.Helper()
+
+	makeDB := func(t *testing.T) (invpkg.InvoiceDB, *clock.TestClock) {
+		testClock := clock.NewTestClock(testTime)
+		db, err := channeldb.MakeTestInvoiceDB(
+			t, channeldb.OptionClock(testClock),
+		)
+		require.NoError(t, err, "unable to make test db")
+
+		return db, testClock
+	}
+
+	ctx := newTestContext(t, nil, makeDB)
+
+	var payAddr [32]byte
+	_, err := rand.Read(payAddr[:])
+	require.NoError(t, err)
+
+	inv := &invpkg.Invoice{
+		CreationDate: testInvoiceCreationDate,
+		Terms: invpkg.ContractTerm{
+			PaymentPreimage: &testInvoicePreimage,
+			PaymentAddr:     payAddr,
+			Value:           0,
+			Expiry:          time.Hour,
+			Features: lnwire.NewFeatureVector(
+				lnwire.NewRawFeatureVector(
+					lnwire.TLVOnionPayloadRequired,
+					lnwire.PaymentAddrRequired,
+				),
+				lnwire.Features,
+			),
+		},
+	}
+	_, err = ctx.registry.AddInvoice(
+		t.Context(), inv, testInvoicePaymentHash,
+	)
+	require.NoError(t, err)
+
+	return ctx, payAddr
+}
+
+// sendAmountlessHtlc delivers an exit-hop HTLC to the recipient and returns its
+// direct resolution (nil when the HTLC is held as a partial payment).
+func sendAmountlessHtlc(t *testing.T, ctx *testContext,
+	amt lnwire.MilliSatoshi, circuitID uint64, hodlChan chan interface{},
+	payload invpkg.Payload) invpkg.HtlcResolution {
+
+	t.Helper()
+
+	res, err := ctx.registry.NotifyExitHopHtlc(
+		testInvoicePaymentHash, amt, testHtlcExpiry, testCurrentHeight,
+		getCircuitKey(circuitID), hodlChan, nil, payload,
+	)
+	require.NoError(t, err)
+
+	return res
+}
+
+// assertAmountlessOpenUnpaid asserts the invoice is still open and that nothing
+// has been credited to it. Accepted (held) HTLCs on an open, non-AMP invoice do
+// not increment AmtPaid.
+func assertAmountlessOpenUnpaid(t *testing.T, ctx *testContext) {
+	t.Helper()
+
+	inv, err := ctx.registry.LookupInvoice(
+		t.Context(), testInvoicePaymentHash,
+	)
+	require.NoError(t, err)
+	require.Equal(t, invpkg.ContractOpen, inv.State)
+	require.Zero(t, inv.AmtPaid)
+}
+
+// settleAmountlessInvoice drives a full honest two-shard MPP payment of the
+// sender-committed total (with the correct payment address) and returns once
+// the invoice has settled and revealed the real preimage.
+func settleAmountlessInvoice(t *testing.T, ctx *testContext, payAddr [32]byte) {
+	t.Helper()
+
+	honest := &mockPayload{
+		mpp: record.NewMPP(amountlessSenderTotal, payAddr),
+	}
+
+	shard1 := make(chan interface{}, 1)
+	res := sendAmountlessHtlc(t, ctx, 400_000, 7, shard1, honest)
+	require.Nil(t, res, "first honest shard must be held")
+
+	res = sendAmountlessHtlc(
+		t, ctx, 600_000, 8, make(chan interface{}, 1), honest,
+	)
+	settleRes := checkSettleResolution(t, res, testInvoicePreimage)
+	require.Equal(t, invpkg.ResultSettled, settleRes.Outcome)
+
+	// The first held shard is settled with the same preimage.
+	select {
+	case r := <-shard1:
+		htlcRes, _ := r.(invpkg.HtlcResolution)
+		checkSettleResolution(t, htlcRes, testInvoicePreimage)
+
+	case <-time.After(testTimeout):
+		t.Fatal("timeout waiting for shard settle resolution")
+	}
+
+	inv, err := ctx.registry.LookupInvoice(
+		t.Context(), testInvoicePaymentHash,
+	)
+	require.NoError(t, err)
+	require.Equal(t, invpkg.ContractSettled, inv.State)
+	require.Equal(t, amountlessSenderTotal, inv.AmtPaid)
+}
+
+// waitMppTimeout advances the clock past the MPP hold duration and asserts that
+// the held HTLC on the given channel is failed back with an MPP timeout (and so
+// never reveals a preimage).
+func waitMppTimeout(t *testing.T, ctx *testContext, hodlChan chan interface{}) {
+	t.Helper()
+
+	ctx.clock.SetTime(ctx.clock.Now().Add(35 * time.Second))
+
+	select {
+	case r := <-hodlChan:
+		htlcRes, _ := r.(invpkg.HtlcResolution)
+		checkFailResolution(t, htlcRes, invpkg.ResultMppTimeout)
+
+	case <-time.After(testTimeout):
+		t.Fatal("timeout waiting for mpp timeout resolution")
+	}
+}
+
+// testMppPaymentToAmountlessInvoice proves that a zero-amount ("amountless")
+// invoice cannot be exploited by a malicious last hop via the classic
+// zero-amount-invoice / last-hop attack. For an amountless invoice the payer
+// chooses the amount, so the recipient has no invoice-encoded amount to check
+// an HTLC against; trustlessness instead rests on two checks in updateMpp: the
+// payment address (the payment secret, which a relay cannot read because it is
+// encrypted to the recipient) and the sender-committed total (total_msat).
+//
+// Each attack variant is exercised as an isolated table-driven sub-test that
+// drives the recipient path (NotifyExitHopHtlc) against its own fresh
+// amountless invoice, asserting that none of them can steal the preimage or
+// force settlement below the sender-committed amount, while an honest payment
+// at the payer's chosen amount still settles.
+//
+// NOTE: This exercises the invoices registry enforcement only. It does not
+// cover the htlcswitch/link or onion layers, sender-side behaviour, or the
+// keysend path (intentionally out of scope). Underpayment prevention here is
+// policy enforced by the payment-secret and committed-total checks, not a
+// cryptographic binding of the amount to the preimage.
+func TestMppPaymentToAmountlessInvoice(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		run  func(t *testing.T, ctx *testContext, payAddr [32]byte)
+	}{
+		{
+			// Mallory forges her own HTLC reusing the payment hash
+			// but does not know the payment secret, so she sends a
+			// blank payment address. A blank address is looked up
+			// by hash only, so the invoice is found and the address
+			// check in updateMpp rejects it on every backend.
+			name: "forged htlc with blank payment address",
+			run: func(t *testing.T, ctx *testContext,
+				payAddr [32]byte) {
+
+				res := sendAmountlessHtlc(
+					t, ctx, amountlessDustAmt, 1,
+					make(chan interface{}, 1), &mockPayload{
+						mpp: record.NewMPP(
+							amountlessDustAmt,
+							[32]byte{},
+						),
+					},
+				)
+				checkFailResolution(
+					t, res, invpkg.ResultAddressMismatch,
+				)
+				assertAmountlessOpenUnpaid(t, ctx)
+			},
+		},
+		{
+			// The same forge, but with a random (still wrong)
+			// payment address. Either the DB lookup fails outright
+			// (SQL backends filter by hash AND address) or the
+			// updateMpp address check rejects it (the kv backend
+			// falls back to a hash lookup). Both reject the attack.
+			name: "forged htlc with wrong payment address",
+			run: func(t *testing.T, ctx *testContext,
+				payAddr [32]byte) {
+
+				var wrongAddr [32]byte
+				_, err := rand.Read(wrongAddr[:])
+				require.NoError(t, err)
+
+				res := sendAmountlessHtlc(
+					t, ctx, amountlessDustAmt, 1,
+					make(chan interface{}, 1), &mockPayload{
+						mpp: record.NewMPP(
+							amountlessDustAmt,
+							wrongAddr,
+						),
+					},
+				)
+				failRes, ok := res.(*invpkg.HtlcFailResolution)
+				require.True(
+					t, ok, "expected fail resolution, "+
+						"got %T", res,
+				)
+				require.Contains(t,
+					[]invpkg.FailResolutionResult{
+						invpkg.ResultAddressMismatch,
+						invpkg.ResultInvoiceNotFound,
+					}, failRes.Outcome,
+				)
+				assertAmountlessOpenUnpaid(t, ctx)
+			},
+		},
+		{
+			// Even with the correct payment address, a set that
+			// commits to a zero total is rejected. This guard is
+			// what stops an amountless invoice from being settled
+			// for nothing.
+			name: "correct address but zero committed total",
+			run: func(t *testing.T, ctx *testContext,
+				payAddr [32]byte) {
+
+				res := sendAmountlessHtlc(
+					t, ctx, amountlessDustAmt, 1,
+					make(chan interface{}, 1), &mockPayload{
+						mpp: record.NewMPP(0, payAddr),
+					},
+				)
+				checkFailResolution(
+					t, res,
+					invpkg.ResultHtlcSetTotalTooLow,
+				)
+				assertAmountlessOpenUnpaid(t, ctx)
+			},
+		},
+		{
+			// Mallory strips the MPP payload entirely, forcing the
+			// legacy settlement path. Because the invoice requires
+			// a payment address, the legacy path rejects it too.
+			// Without this feature bit a zero-value invoice would
+			// be settleable by a bare dust HTLC.
+			name: "stripped mpp payload on legacy path",
+			run: func(t *testing.T, ctx *testContext,
+				payAddr [32]byte) {
+
+				res := sendAmountlessHtlc(
+					t, ctx, amountlessDustAmt, 1,
+					make(chan interface{}, 1),
+					&mockPayload{},
+				)
+				checkFailResolution(
+					t, res, invpkg.ResultAddressMismatch,
+				)
+
+				// The rejected HTLC was not recorded on the
+				// invoice.
+				inv, err := ctx.registry.LookupInvoice(
+					t.Context(), testInvoicePaymentHash,
+				)
+				require.NoError(t, err)
+				require.Equal(
+					t, invpkg.ContractOpen, inv.State,
+				)
+				require.Empty(t, inv.Htlcs)
+			},
+		},
+		{
+			// Mallory forwards Alice's genuine onion (correct
+			// address and committed total) but attaches a shrunken
+			// HTLC amount. The set is incomplete, so it is held as
+			// a partial payment (no direct resolution, no preimage)
+			// and is failed back once the MPP timeout elapses. The
+			// invoice survives: still open, unpaid, and payable.
+			name: "shrunk htlc amount is held then times out",
+			run: func(t *testing.T, ctx *testContext,
+				payAddr [32]byte) {
+
+				shrunkChan := make(chan interface{}, 1)
+				res := sendAmountlessHtlc(
+					t, ctx, amountlessDustAmt, 1,
+					shrunkChan, &mockPayload{
+						mpp: record.NewMPP(
+							amountlessSenderTotal,
+							payAddr,
+						),
+					},
+				)
+				require.Nil(
+					t, res, "shrunk partial payment must "+
+						"be held",
+				)
+
+				inv, err := ctx.registry.LookupInvoice(
+					t.Context(), testInvoicePaymentHash,
+				)
+				require.NoError(t, err)
+				require.Equal(
+					t, invpkg.ContractOpen, inv.State,
+				)
+				require.Zero(t, inv.AmtPaid)
+				require.Equal(
+					t, invpkg.HtlcStateAccepted,
+					inv.Htlcs[getCircuitKey(1)].State,
+				)
+
+				waitMppTimeout(t, ctx, shrunkChan)
+
+				inv, err = ctx.registry.LookupInvoice(
+					t.Context(), testInvoicePaymentHash,
+				)
+				require.NoError(t, err)
+				require.Equal(
+					t, invpkg.ContractOpen, inv.State,
+				)
+				require.Zero(t, inv.AmtPaid)
+				require.Equal(
+					t, invpkg.HtlcStateCanceled,
+					inv.Htlcs[getCircuitKey(1)].State,
+				)
+			},
+		},
+		{
+			// While a shrunk HTLC is held, a second HTLC disagreeing
+			// on the committed total is rejected as a set mismatch.
+			// This stops a relay from mixing HTLCs that commit to
+			// different totals.
+			name: "second htlc disagreeing on committed total",
+			run: func(t *testing.T, ctx *testContext,
+				payAddr [32]byte) {
+
+				res := sendAmountlessHtlc(
+					t, ctx, amountlessDustAmt, 1,
+					make(chan interface{}, 1), &mockPayload{
+						mpp: record.NewMPP(
+							amountlessSenderTotal,
+							payAddr,
+						),
+					},
+				)
+				require.Nil(t, res, "partial payment must "+
+					"be held")
+
+				res = sendAmountlessHtlc(
+					t, ctx, amountlessDustAmt, 2,
+					make(chan interface{}, 1), &mockPayload{
+						mpp: record.NewMPP(
+							2*amountlessSenderTotal,
+							payAddr,
+						),
+					},
+				)
+				checkFailResolution(
+					t, res,
+					invpkg.ResultHtlcSetTotalMismatch,
+				)
+			},
+		},
+		{
+			// An honest payment at the amount the payer chose
+			// settles normally and reveals the real preimage only
+			// once the full committed total has been received.
+			name: "honest payment at sender-chosen amount settles",
+			run: func(t *testing.T, ctx *testContext,
+				payAddr [32]byte) {
+
+				settleAmountlessInvoice(t, ctx, payAddr)
+			},
+		},
+		{
+			// After settlement the invoice can no longer be
+			// exploited: a fresh dust probe is rejected because the
+			// invoice is no longer open, so the preimage is never
+			// released a second time.
+			name: "probe after settlement is rejected",
+			run: func(t *testing.T, ctx *testContext,
+				payAddr [32]byte) {
+
+				settleAmountlessInvoice(t, ctx, payAddr)
+
+				res := sendAmountlessHtlc(
+					t, ctx, amountlessDustAmt, 9,
+					make(chan interface{}, 1), &mockPayload{
+						mpp: record.NewMPP(
+							amountlessDustAmt,
+							payAddr,
+						),
+					},
+				)
+				checkFailResolution(
+					t, res, invpkg.ResultInvoiceNotOpen,
+				)
+			},
+		},
+		{
+			// Replaying a timed-out (canceled) HTLC on the same
+			// circuit key only echoes its canceled state; it cannot
+			// be re-presented to coax out the preimage.
+			name: "replay of a timed-out htlc is rejected",
+			run: func(t *testing.T, ctx *testContext,
+				payAddr [32]byte) {
+
+				honest := &mockPayload{
+					mpp: record.NewMPP(
+						amountlessSenderTotal, payAddr,
+					),
+				}
+
+				shrunkChan := make(chan interface{}, 1)
+				res := sendAmountlessHtlc(
+					t, ctx, amountlessDustAmt, 1,
+					shrunkChan, honest,
+				)
+				require.Nil(t, res)
+
+				waitMppTimeout(t, ctx, shrunkChan)
+
+				res = sendAmountlessHtlc(
+					t, ctx, amountlessDustAmt, 1,
+					make(chan interface{}, 1), honest,
+				)
+				checkFailResolution(
+					t, res, invpkg.ResultReplayToCanceled,
+				)
+			},
+		},
+		{
+			// Replaying a settled shard re-returns the preimage,
+			// which is correct idempotent behaviour (the HTLC
+			// already delivered its share of the committed total),
+			// not a new low-value settle. State is unchanged.
+			name: "replay of a settled htlc is idempotent",
+			run: func(t *testing.T, ctx *testContext,
+				payAddr [32]byte) {
+
+				settleAmountlessInvoice(t, ctx, payAddr)
+
+				honest := &mockPayload{
+					mpp: record.NewMPP(
+						amountlessSenderTotal, payAddr,
+					),
+				}
+				res := sendAmountlessHtlc(
+					t, ctx, 600_000, 8,
+					make(chan interface{}, 1), honest,
+				)
+				replay := checkSettleResolution(
+					t, res, testInvoicePreimage,
+				)
+				require.Equal(
+					t, invpkg.ResultReplayToSettled,
+					replay.Outcome,
+				)
+
+				inv, err := ctx.registry.LookupInvoice(
+					t.Context(), testInvoicePaymentHash,
+				)
+				require.NoError(t, err)
+				require.Equal(
+					t, invpkg.ContractSettled, inv.State,
+				)
+				require.Equal(
+					t, amountlessSenderTotal, inv.AmtPaid,
+				)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			defer timeout()()
+
+			ctx, payAddr := newAmountlessInvoiceCtx(t)
+			tc.run(t, ctx, payAddr)
+		})
+	}
+}
+
 // testInvoiceExpiryWithRegistry tests that invoices are canceled after
 // expiration.
 func testInvoiceExpiryWithRegistry(t *testing.T,
